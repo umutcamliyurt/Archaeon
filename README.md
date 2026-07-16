@@ -22,6 +22,10 @@ Each node broadcasts its own Wi-Fi network. Connect with any IRC client, and you
 
 Every node shares the same encryption key, so any node can relay any message. There's no central server, the mesh keeps working even if a node goes down.
 
+## Example
+
+<img src="image.png" width="500" />
+
 ## What you'll need
 
 - An **ESP32** board with Wi-Fi
