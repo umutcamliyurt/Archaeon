@@ -62,7 +62,8 @@ static void meshKeyInit() {
 #define MAX_CLIENTS     6
 #define MAX_NICK_LEN    24
 #define MAX_CHAN_LEN    32
-#define MAX_LINE_LEN    256
+#define MAX_LINE_LEN    512
+#define IRC_MAX_LINE    512
 #define DEFAULT_CHANNEL "#mesh"
 #define SERVER_NAME     "archaeon.mesh"
 #define MAX_CHANNELS_PER_CLIENT 4
@@ -79,7 +80,14 @@ struct IRCClient {
   uint8_t channelCount = 0;
   char lineBuf[MAX_LINE_LEN];
   size_t lineIdx = 0;
+  bool capNegotiating = false;
+  unsigned long lastActivity = 0;
+  unsigned long pingSentAt = 0;
+  bool awaitingPong = false;
 };
+
+#define IRC_PING_INTERVAL_MS    60000UL
+#define IRC_PING_GRACE_MS       20000UL
 
 IRCClient clients[MAX_CLIENTS];
 
@@ -144,6 +152,9 @@ void ircNumericf(IRCClient &c, int code, const char *fmt, ...);
 void ircJoinAndAnnounce(IRCClient &c, const char *chan);
 void ircWelcome(IRCClient &c);
 void ircHandleLine(IRCClient &c, char *line);
+void ircQuitClient(IRCClient &c, const char *reason, bool sendError);
+bool ircNickInUse(const char *nick, IRCClient *exclude);
+bool ircNickValid(const char *nick);
 
 static uint32_t crc32Table[256];
 static bool crc32TableReady = false;
@@ -531,8 +542,29 @@ void partChannel(IRCClient &c, const char *chan) {
 
 void ircSendLine(IRCClient &c, const char *line) {
   if (!c.active || !c.conn.connected()) return;
-  c.conn.print(line);
+  size_t len = strlen(line);
+  const size_t maxPayload = IRC_MAX_LINE - 2;
+  if (len > maxPayload) len = maxPayload;
+  c.conn.write((const uint8_t *)line, len);
   c.conn.print("\r\n");
+}
+
+size_t ircBuildTextLine(char *out, size_t outSize, const char *head, const char *text) {
+  if (outSize == 0) return 0;
+  size_t headLen = strlen(head);
+  if (headLen >= outSize) headLen = outSize - 1;
+  memcpy(out, head, headLen);
+
+  size_t maxPayload = IRC_MAX_LINE - 2;
+  if (maxPayload >= outSize) maxPayload = outSize - 1;
+
+  size_t maxTextLen = (maxPayload > headLen) ? (maxPayload - headLen) : 0;
+  size_t textLen = strlen(text);
+  if (textLen > maxTextLen) textLen = maxTextLen;
+
+  memcpy(out + headLen, text, textLen);
+  out[headLen + textLen] = '\0';
+  return headLen + textLen;
 }
 
 void ircNumericf(IRCClient &c, int code, const char *fmt, ...) {
@@ -549,21 +581,24 @@ void ircNumericf(IRCClient &c, int code, const char *fmt, ...) {
 }
 
 void ircBroadcastLocal(const char *channel, const char *fromNick, const char *text, IRCClient *except) {
-  char line[256];
+  char line[IRC_MAX_LINE];
+  char head[80];
   if (channel[0] == '@') {
     const char *targetNick = channel + 1;
     IRCClient *c = ircFindClientByNick(targetNick);
     if (!c || c == except) return;
-    snprintf(line, sizeof(line), ":%s PRIVMSG %s :%s", fromNick, targetNick, text);
+    snprintf(head, sizeof(head), ":%s PRIVMSG %s :", fromNick, targetNick);
+    ircBuildTextLine(line, sizeof(line), head, text);
     ircSendLine(*c, line);
     return;
   }
+  snprintf(head, sizeof(head), ":%s PRIVMSG %s :", fromNick, channel);
   for (int i = 0; i < MAX_CLIENTS; ++i) {
     IRCClient &c = clients[i];
     if (!c.active || !c.registered) continue;
     if (&c == except) continue;
     if (!isInChannel(c, channel)) continue;
-    snprintf(line, sizeof(line), ":%s PRIVMSG %s :%s", fromNick, channel, text);
+    ircBuildTextLine(line, sizeof(line), head, text);
     ircSendLine(c, line);
   }
 }
@@ -581,11 +616,65 @@ void ircJoinAndAnnounce(IRCClient &c, const char *chan) {
   ircNumericf(c, 366, "%s :End of /NAMES list", chan);
 }
 
+bool ircNickValid(const char *nick) {
+  size_t len = strlen(nick);
+  if (len == 0 || len >= MAX_NICK_LEN) return false;
+  char first = nick[0];
+  if (!isalpha((unsigned char)first) && strchr("_[]\\^{}|`", first) == NULL) return false;
+  for (size_t i = 0; i < len; ++i) {
+    char ch = nick[i];
+    if (isalnum((unsigned char)ch)) continue;
+    if (strchr("_[]\\^{}|`-", ch) != NULL) continue;
+    return false;
+  }
+  return true;
+}
+
+bool ircNickInUse(const char *nick, IRCClient *exclude) {
+  for (int i = 0; i < MAX_CLIENTS; ++i) {
+    IRCClient &c = clients[i];
+    if (!c.active || &c == exclude) continue;
+    if (c.nick[0] && strcasecmp(c.nick, nick) == 0) return true;
+  }
+  return false;
+}
+
+void ircQuitClient(IRCClient &c, const char *reason, bool sendError) {
+  if (!c.active) return;
+  if (c.registered) {
+    char fullNick[48];
+    snprintf(fullNick, sizeof(fullNick), "%s!%s@local", c.nick[0] ? c.nick : "*", c.user[0] ? c.user : "user");
+    char quitLine[220];
+    snprintf(quitLine, sizeof(quitLine), ":%s QUIT :%s", fullNick, reason ? reason : "Client quit");
+    for (uint8_t ci = 0; ci < c.channelCount; ++ci) {
+      for (int i = 0; i < MAX_CLIENTS; ++i) {
+        IRCClient &other = clients[i];
+        if (!other.active || !other.registered || &other == &c) continue;
+        if (isInChannel(other, c.channels[ci])) ircSendLine(other, quitLine);
+      }
+    }
+  }
+  if (sendError) {
+    char errLine[128];
+    snprintf(errLine, sizeof(errLine), "ERROR :Closing link: %s", reason ? reason : "Client quit");
+    ircSendLine(c, errLine);
+  }
+  c.conn.stop();
+  c.active = false;
+  oledDirty = true;
+}
+
 void ircWelcome(IRCClient &c) {
-  ircNumericf(c, 1, ":Welcome to the Archaeon LoRa-mesh IRC network, %s", c.nick);
+  ircNumericf(c, 1, ":Welcome to the Archaeon LoRa-mesh IRC network, %s!%s@local",
+              c.nick, c.user[0] ? c.user : "user");
   ircNumericf(c, 2, ":Your host is %s, running on node %s", SERVER_NAME, nodeID);
   ircNumericf(c, 3, ":Mesh traffic is AES-128 encrypted and relayed over LoRa");
   ircNumericf(c, 4, "%s archaeon-mesh-1.0 o o", SERVER_NAME);
+  ircNumericf(c, 5, "CHANTYPES=# NICKLEN=%d CHANNELLEN=%d CHANLIMIT=#:%d PREFIX= :are supported by this server",
+              MAX_NICK_LEN - 1, MAX_CHAN_LEN - 1, MAX_CHANNELS_PER_CLIENT);
+  ircNumericf(c, 375, ":- %s Message of the day -", SERVER_NAME);
+  ircNumericf(c, 372, ":- Welcome to the mesh. Traffic on this server also flows over LoRa radio.");
+  ircNumericf(c, 376, ":End of /MOTD command");
   ircJoinAndAnnounce(c, DEFAULT_CHANNEL);
 }
 
@@ -593,6 +682,9 @@ void ircHandleLine(IRCClient &c, char *line) {
   size_t len = strlen(line);
   while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) line[--len] = '\0';
   if (len == 0) return;
+
+  c.lastActivity = millis();
+  c.awaitingPong = false;
 
   Serial.print("[IRC ");
   Serial.print(c.nick[0] ? c.nick : "?");
@@ -614,24 +706,158 @@ void ircHandleLine(IRCClient &c, char *line) {
   }
   for (char *p = cmd; *p; ++p) *p = toupper(*p);
 
-  if (strcmp(cmd, "NICK") == 0) {
+  static const char *PRE_REGISTER_OK[] = { "PASS", "CAP", "NICK", "USER", "PING", "PONG", "QUIT" };
+  if (!c.registered) {
+    bool allowed = false;
+    for (size_t k = 0; k < sizeof(PRE_REGISTER_OK) / sizeof(PRE_REGISTER_OK[0]); ++k) {
+      if (strcmp(cmd, PRE_REGISTER_OK[k]) == 0) { allowed = true; break; }
+    }
+    if (!allowed) {
+      ircNumericf(c, 451, ":You have not registered");
+      return;
+    }
+  }
+
+  if (strcmp(cmd, "PASS") == 0) {
+
+  } else if (strcmp(cmd, "CAP") == 0) {
+    char *sub = space;
+    char subCmd[16];
+    sscanf(sub, "%15s", subCmd);
+    for (char *p = subCmd; *p; ++p) *p = toupper(*p);
+    if (strcmp(subCmd, "LS") == 0) {
+      c.capNegotiating = true;
+      char line[64];
+      snprintf(line, sizeof(line), ":%s CAP * LS :", SERVER_NAME);
+      ircSendLine(c, line);
+    } else if (strcmp(subCmd, "REQ") == 0) {
+      char line[64];
+      snprintf(line, sizeof(line), ":%s CAP * NAK :", SERVER_NAME);
+      ircSendLine(c, line);
+    } else if (strcmp(subCmd, "END") == 0) {
+      c.capNegotiating = false;
+    }
+
+  } else if (strcmp(cmd, "NICK") == 0) {
     char *n = space;
     if (*n == ':') n++;
-    strncpy(c.nick, n, sizeof(c.nick) - 1);
-    c.nick[sizeof(c.nick) - 1] = '\0';
-    for (char *p = c.nick; *p; ++p) if (*p == ' ' || *p == '\r') { *p = '\0'; break; }
-    if (c.user[0] && !c.registered) { c.registered = true; ircWelcome(c); }
+    char newNick[MAX_NICK_LEN];
+    strncpy(newNick, n, sizeof(newNick) - 1);
+    newNick[sizeof(newNick) - 1] = '\0';
+    for (char *p = newNick; *p; ++p) if (*p == ' ' || *p == '\r') { *p = '\0'; break; }
+
+    if (!ircNickValid(newNick)) {
+      ircNumericf(c, 432, "%s :Erroneous nickname", newNick);
+    } else if (ircNickInUse(newNick, &c)) {
+      ircNumericf(c, 433, "%s :Nickname is already in use", newNick);
+    } else {
+      bool hadOldNick = c.registered && c.nick[0];
+      char oldFullNick[48];
+      if (hadOldNick) snprintf(oldFullNick, sizeof(oldFullNick), "%s!%s@local", c.nick, c.user[0] ? c.user : "user");
+      strncpy(c.nick, newNick, sizeof(c.nick) - 1);
+      c.nick[sizeof(c.nick) - 1] = '\0';
+
+      if (hadOldNick) {
+        char line[96];
+        snprintf(line, sizeof(line), ":%s NICK :%s", oldFullNick, c.nick);
+        for (uint8_t ci = 0; ci < c.channelCount; ++ci) {
+          for (int i = 0; i < MAX_CLIENTS; ++i) {
+            IRCClient &other = clients[i];
+            if (!other.active || !other.registered) continue;
+            if (&other != &c && !isInChannel(other, c.channels[ci])) continue;
+            ircSendLine(other, line);
+          }
+        }
+      } else if (c.user[0] && !c.registered) {
+        c.registered = true;
+        ircWelcome(c);
+      }
+    }
 
   } else if (strcmp(cmd, "USER") == 0) {
     char uname[MAX_NICK_LEN];
     sscanf(space, "%23s", uname);
     strncpy(c.user, uname, sizeof(c.user) - 1);
+    c.user[sizeof(c.user) - 1] = '\0';
     if (c.nick[0] && !c.registered) { c.registered = true; ircWelcome(c); }
 
   } else if (strcmp(cmd, "PING") == 0) {
     char pong[256];
     snprintf(pong, sizeof(pong), ":%s PONG %s %s", SERVER_NAME, SERVER_NAME, space);
     ircSendLine(c, pong);
+
+  } else if (strcmp(cmd, "PONG") == 0) {
+
+  } else if (strcmp(cmd, "MODE") == 0) {
+    char target[MAX_CHAN_LEN];
+    sscanf(space, "%31s", target);
+    if (target[0] == '#') {
+      ircNumericf(c, 324, "%s +", target);
+    } else {
+      ircNumericf(c, 221, "+");
+    }
+
+  } else if (strcmp(cmd, "WHO") == 0) {
+    char target[MAX_CHAN_LEN];
+    if (sscanf(space, "%31s", target) == 1 && target[0] == '#') {
+      for (int i = 0; i < MAX_CLIENTS; ++i) {
+        IRCClient &other = clients[i];
+        if (!other.active || !other.registered) continue;
+        if (!isInChannel(other, target)) continue;
+        ircNumericf(c, 352, "%s %s local %s %s H :0 %s",
+                    target, other.user[0] ? other.user : "user", SERVER_NAME, other.nick, other.nick);
+      }
+      ircNumericf(c, 315, "%s :End of /WHO list", target);
+    } else {
+      ircNumericf(c, 315, "* :End of /WHO list");
+    }
+
+  } else if (strcmp(cmd, "WHOIS") == 0) {
+    char target[MAX_NICK_LEN];
+    sscanf(space, "%23s", target);
+    IRCClient *who = ircFindClientByNick(target);
+    if (!who) {
+      ircNumericf(c, 401, "%s :No such nick", target);
+    } else {
+      ircNumericf(c, 311, "%s %s local * :%s", who->nick, who->user[0] ? who->user : "user", who->nick);
+      ircNumericf(c, 312, "%s %s :Archaeon mesh node", who->nick, SERVER_NAME);
+      ircNumericf(c, 318, "%s :End of /WHOIS list", who->nick);
+    }
+
+  } else if (strcmp(cmd, "TOPIC") == 0) {
+    char chan[MAX_CHAN_LEN];
+    if (sscanf(space, "%31s", chan) == 1 && chan[0]) {
+      ircNumericf(c, 331, "%s :No topic is set", chan);
+    }
+
+  } else if (strcmp(cmd, "LIST") == 0) {
+    ircNumericf(c, 321, "Channel :Users  Name");
+    ircNumericf(c, 323, ":End of /LIST");
+
+  } else if (strcmp(cmd, "NOTICE") == 0) {
+    char *target = space;
+    char *colon = strchr(space, ':');
+    char *text = "";
+    if (colon) {
+      *colon = '\0';
+      text = colon + 1;
+      char *tend = target + strlen(target);
+      while (tend > target && *(tend - 1) == ' ') *(--tend) = '\0';
+    }
+    if (target[0] && text[0] && target[0] == '#' && isInChannel(c, target)) {
+      char fullNick[48];
+      snprintf(fullNick, sizeof(fullNick), "%s!%s@local", c.nick, c.user[0] ? c.user : "user");
+      char head[80];
+      char line[IRC_MAX_LINE];
+      snprintf(head, sizeof(head), ":%s NOTICE %s :", fullNick, target);
+      ircBuildTextLine(line, sizeof(line), head, text);
+      for (int i = 0; i < MAX_CLIENTS; ++i) {
+        IRCClient &other = clients[i];
+        if (!other.active || !other.registered || &other == &c) continue;
+        if (!isInChannel(other, target)) continue;
+        ircSendLine(other, line);
+      }
+    }
 
   } else if (strcmp(cmd, "JOIN") == 0) {
     char *list = space;
@@ -692,9 +918,12 @@ void ircHandleLine(IRCClient &c, char *line) {
     }
 
   } else if (strcmp(cmd, "QUIT") == 0) {
-    ircSendLine(c, "ERROR :Closing link");
-    c.conn.stop();
-    c.active = false;
+    char *reason = space;
+    if (*reason == ':') reason++;
+    ircQuitClient(c, reason[0] ? reason : "Client quit", true);
+
+  } else {
+    ircNumericf(c, 421, "%s :Unknown command", cmd);
   }
 }
 
@@ -707,7 +936,9 @@ void ircPollClients() {
         clients[i] = IRCClient();
         clients[i].conn = newConn;
         clients[i].active = true;
+        clients[i].lastActivity = millis();
         placed = true;
+        oledDirty = true;
         Serial.println("[IRC] New client connected");
         break;
       }
@@ -718,10 +949,12 @@ void ircPollClients() {
     }
   }
 
+  unsigned long now = millis();
   for (int i = 0; i < MAX_CLIENTS; ++i) {
     IRCClient &c = clients[i];
     if (!c.active) continue;
-    if (!c.conn.connected()) { c.active = false; continue; }
+    if (!c.conn.connected()) { ircQuitClient(c, "Connection reset by peer", false); continue; }
+
     int avail;
     while ((avail = c.conn.available()) > 0) {
       uint8_t chunk[64];
@@ -736,6 +969,19 @@ void ircPollClients() {
           if (c.lineIdx < MAX_LINE_LEN - 1) c.lineBuf[c.lineIdx++] = ch;
         }
       }
+    }
+    if (!c.active) continue;
+
+    if (c.awaitingPong) {
+      if (now - c.pingSentAt > IRC_PING_GRACE_MS) {
+        ircQuitClient(c, "Ping timeout", true);
+      }
+    } else if (now - c.lastActivity > IRC_PING_INTERVAL_MS) {
+      char pingLine[64];
+      snprintf(pingLine, sizeof(pingLine), "PING :%s", SERVER_NAME);
+      ircSendLine(c, pingLine);
+      c.awaitingPong = true;
+      c.pingSentAt = now;
     }
   }
 }
